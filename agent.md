@@ -175,7 +175,10 @@ python scripts/run_platform_baselines.py --split train --max-projects 50 --max-s
 # 数据
 python -m src.dataset --max-projects 50
 
-# 正式训练（默认全量 + utility + 分离超参）
+# 全量正式流程（BC → DQN，bash）
+bash scripts/run_full_platform.sh
+
+# 或分步（Windows / 手动指定 checkpoint）
 python scripts/pretrained_platform_bc.py --side worker  --max-projects 0 --episodes 5 --max-steps 0 --device cuda
 python scripts/pretrained_platform_bc.py --side requester --max-projects 0 --episodes 5 --max-steps 0 --device cuda
 python scripts/train_platform_dqn.py --device cuda \
@@ -264,6 +267,7 @@ include_truth_in_candidates=True
 
 - **Reward 双模式**：`utility`（默认）用可观测利益 proxy 训练；`hit_rate` 仅诊断。`legacy` 复现旧 hit 导向实验。
 - **Requester 触发条件**（默认非即时）：申请池 ≥ `requester_batch_size`（8）/ 距 deadline ≤ `requester_deadline_buffer_hours`（24h）/ 池满 32 / deadline 强制。
+- **Worker 候选 lookahead**（默认 168h）：纳入即将开放的 project，缓解 val/test 候选 median=1；`--no-project-lookahead` 关闭。
 - **申请池过小**：即时选人时池子恒为 1；batch 模式下 train 上 `avg_requester_pool_size` 约 7–9。诊断：`python scripts/analyze_pool_candidates.py --max-projects 50 --max-steps 200`。
 - **`max_steps_per_episode` 未在 `step()` 内强制**：评估/诊断脚本须自行限制步数；`wait_until_deadline` 全 WAIT 时会无限循环。
 - **旧 checkpoint 不兼容**：特征 14/17 维 + batch requester + utility reward 均与 `runs/report_full_20260529` 不同，需重训。

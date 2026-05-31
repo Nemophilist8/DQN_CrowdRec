@@ -46,6 +46,8 @@ class PlatformEnvConfig:
     requester_immediate_decision: bool = False
     requester_batch_size: int = 8
     requester_deadline_buffer_hours: float = 24.0
+    # Worker 候选：纳入 start_date 在未来 lookahead 窗口内的 project（缓解并发 active 过少）
+    project_lookahead_hours: float = 168.0
     # utility：最大化可观测利益 proxy；legacy：以历史 hit 为主（对照实验）
     reward_mode: RewardMode = "utility"
     utility_award_weight: float = 0.35
@@ -598,9 +600,12 @@ class PlatformSimulationEnv:
         active: list[ProjectRecord] = []
         truth_project: ProjectRecord | None = None
 
+        lookahead = timedelta(hours=max(self.config.project_lookahead_hours, 0.0))
         for state in self.project_states.values():
             p = state.project
-            if state.closed or p.start_date > t or t >= p.deadline:
+            if state.closed or t >= p.deadline:
+                continue
+            if p.start_date > t + lookahead:
                 continue
             if ev.worker_id in state.applicants:
                 continue
@@ -659,7 +664,8 @@ class PlatformSimulationEnv:
         profile = self.encoder.worker_history_profile(ev.worker_id, t)
         chosen: list[ProjectRecord] = []
         chosen_ids: set[int] = set()
-        quarter = max(target_size // 4, 1)
+        match_slots = max(target_size // 2, 1)
+        other_slots = max((target_size - match_slots) // 3, 1)
 
         def take(projects: list[ProjectRecord], limit: int) -> None:
             for project in projects:
@@ -687,13 +693,13 @@ class PlatformSimulationEnv:
                 p.project_id,
             ),
         )
-        take(match_pool, quarter)
+        take(match_pool, match_slots)
 
         popularity_pool = sorted(
             active,
             key=lambda p: (-p.entry_count, -p.total_awards, p.project_id),
         )
-        take(popularity_pool, quarter)
+        take(popularity_pool, other_slots)
 
         low_wait_pool = sorted(
             active,
@@ -703,11 +709,11 @@ class PlatformSimulationEnv:
                 p.project_id,
             ),
         )
-        take(low_wait_pool, quarter)
+        take(low_wait_pool, other_slots)
 
         remaining = [p for p in active if p.project_id not in chosen_ids]
         self.rng.shuffle(remaining)
-        take(remaining, quarter)
+        take(remaining, other_slots)
 
         if len(chosen) < target_size:
             filler = sorted(
@@ -1190,6 +1196,17 @@ def add_platform_env_cli_args(parser: Any) -> None:
     parser.add_argument("--requester-batch-size", type=int, default=8)
     parser.add_argument("--requester-deadline-buffer-hours", type=float, default=24.0)
     parser.add_argument("--no-mixed-recall", action="store_true")
+    parser.add_argument(
+        "--project-lookahead-hours",
+        type=float,
+        default=168.0,
+        help="Worker 候选纳入 start_date 在未来 N 小时内的 project；0=仅已开放",
+    )
+    parser.add_argument(
+        "--no-project-lookahead",
+        action="store_true",
+        help="等价于 --project-lookahead-hours 0",
+    )
 
 
 def platform_env_config_from_args(args: Any, **overrides: Any) -> PlatformEnvConfig:
@@ -1207,6 +1224,11 @@ def platform_env_config_from_args(args: Any, **overrides: Any) -> PlatformEnvCon
         requester_batch_size=getattr(args, "requester_batch_size", 8),
         requester_deadline_buffer_hours=getattr(
             args, "requester_deadline_buffer_hours", 24.0
+        ),
+        project_lookahead_hours=(
+            0.0
+            if getattr(args, "no_project_lookahead", False)
+            else getattr(args, "project_lookahead_hours", 168.0)
         ),
         max_steps_per_episode=overrides.pop("max_steps_per_episode", None),
     )

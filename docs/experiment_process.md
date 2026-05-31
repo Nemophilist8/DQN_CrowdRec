@@ -239,6 +239,17 @@
 - 可能原因：batch 模式下 requester 决策约为 worker 的 1/4，必须单独调小 batch 与 ε 衰减步数。
 - 针对本次尝试的改进方向：utility 全量重训 + test 基线；视曲线再调 `episodes` 或 requester BC 预训练。
 
+### 2026-05-31 全量跑前必要优化（lookahead / min-batch / BC 默认）
+
+- 目的：为即将进行的 `max_steps=0` 全量实验消除已知瓶颈（worker 候选过少、requester 长期不更新、BC/训练默认仍偏调试）。
+- 具体调整：
+  - `project_lookahead_hours=168`：Worker 候选纳入 7 天内将开放的 project。
+  - 混合召回匹配路占比 1/4 → **1/2**。
+  - DQN `min_batch_size`：buffer 未满 `batch_size` 时也可更新；requester 默认 `min_batch=8`。
+  - `pretrained_platform_bc.py` 默认：`max_projects=0`、`max_steps=0`、`episodes=8`、`device=cuda`。
+  - `train_platform_dqn.py` 默认 `episodes=30`；新增 `scripts/run_full_platform.sh` 一键 BC→DQN。
+- 命令：`bash scripts/run_full_platform.sh` 或见 `agent.md` §4.4。
+
 ### 2026-05-22 参与者侧全量 Vanilla DQN 初次训练
 
 - 目的：用全量项目训练参与者侧任务推荐模型，获得一版可用于后续 test 评估和 DQN 变体对比的 worker 侧基准模型。

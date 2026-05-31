@@ -193,6 +193,7 @@ class DQNConfig:
     gamma: float = 0.99
     lr: float = 1e-3
     batch_size: int = 64
+    min_batch_size: int = 16
     buffer_size: int = 50_000
     target_update_freq: int = 200
     epsilon_start: float = 1.0
@@ -278,10 +279,12 @@ class DQNAgent:
         return result.loss if result else None
 
     def update_with_stats(self) -> UpdateResult | None:
-        if len(self.replay) < self.cfg.batch_size:
+        buffer_len = len(self.replay)
+        if buffer_len < self.cfg.min_batch_size:
             return None
 
-        batch = self.replay.sample(self.cfg.batch_size)
+        effective_batch = min(buffer_len, self.cfg.batch_size)
+        batch = self.replay.sample(effective_batch)
         obs_w, obs_c, obs_m = self._batch_obs([t.obs for t in batch])
         next_w, next_c, next_m = self._batch_obs([t.next_obs for t in batch])
         actions = torch.tensor([t.action for t in batch], dtype=torch.long, device=self.device)

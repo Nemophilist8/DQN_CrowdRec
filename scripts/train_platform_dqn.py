@@ -35,7 +35,7 @@ def main() -> None:
         default=0,
         help="0=全量；调试可设 50/100",
     )
-    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument("--num-project-candidates", type=int, default=32)
     parser.add_argument("--num-worker-candidates", type=int, default=32)
     parser.add_argument("--include-truth-in-candidates", action="store_true")
@@ -53,6 +53,7 @@ def main() -> None:
         help="若指定则同时覆盖 worker/requester replay batch（兼容旧 CLI）",
     )
     parser.add_argument("--requester-replay-batch", type=int, default=32)
+    parser.add_argument("--requester-min-batch", type=int, default=8)
     parser.add_argument("--worker-replay-buffer", type=int, default=100_000)
     parser.add_argument("--requester-replay-buffer", type=int, default=50_000)
     parser.add_argument(
@@ -151,6 +152,7 @@ def main() -> None:
         device=args.device,
         lr=args.lr,
         batch_size=worker_batch,
+        min_batch_size=16,
         buffer_size=worker_buffer,
         target_update_freq=args.target_update_freq,
         epsilon_decay_steps=args.epsilon_decay_steps,
@@ -164,6 +166,7 @@ def main() -> None:
         device=args.device,
         lr=requester_lr,
         batch_size=requester_batch,
+        min_batch_size=args.requester_min_batch,
         buffer_size=requester_buffer,
         target_update_freq=args.target_update_freq,
         epsilon_decay_steps=args.requester_epsilon_decay_steps,
