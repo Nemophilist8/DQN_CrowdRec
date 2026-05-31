@@ -11,7 +11,13 @@ import numpy as np
 from src.dataset import CrowdsourcingDataset, ProjectRecord
 
 WORKER_FEAT_DIM = 12
-PROJECT_FEAT_DIM = 13
+PROJECT_FEAT_DIM = 13  # legacy worker/requester 环境
+
+# Platform 动态环境专用（与 legacy 分离，避免旧 checkpoint 维度不一致）
+# Worker 侧 project 候选：13 维基础 + industry_match
+PLATFORM_PROJECT_FEAT_DIM = 14
+# Requester 侧 project 上下文：13 维基础 + 4 维申请池质量统计
+REQUESTER_CONTEXT_FEAT_DIM = 17
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,29 @@ class FeatureEncoder:
         )
         self._profile_cache[cache_key] = profile
         return profile
+
+    def worker_category_stats(
+        self,
+        worker_id: int,
+        category: int,
+        t: datetime,
+    ) -> tuple[float, float, int]:
+        """Worker 在指定类目上的历史均分、胜率与投稿数（仅 t 之前）。"""
+        past = self._past_entries(worker_id, t)
+        in_cat = [
+            e
+            for e in past
+            if (p := self.dataset.projects.get(e.project_id)) is not None
+            and p.category == category
+        ]
+        if not in_cat:
+            return 0.0, 0.0, 0
+        n = len(in_cat)
+        return (
+            float(np.mean([e.max_revision_score for e in in_cat])),
+            sum(1 for e in in_cat if e.winner) / n,
+            n,
+        )
 
     def worker_features(self, worker_id: int, t: datetime) -> np.ndarray:
         q = self.dataset.get_worker_quality(worker_id)

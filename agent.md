@@ -44,7 +44,7 @@
 │   ├── config.py            # 加载 YAML
 │   ├── dataset.py           # 数据加载、划分、事件流、cache v2
 │   ├── platform_dataset.py  # 动态平台统一事件/outcome 索引
-│   └── features.py          # Worker(12维) / Project(13维) 特征
+│   └── features.py          # Worker(12) / Legacy Project(13) / Platform 专用维度
 ├── env/
 │   ├── platform_env.py      # 动态双边平台 MDP（主线）
 │   ├── worker_env.py        # legacy 参与者 MDP
@@ -62,6 +62,8 @@
 │   ├── train_platform_dqn.py
 │   ├── evaluate_platform.py
 │   ├── run_platform_baselines.py
+│   ├── pretrained_platform_bc.py # Platform 侧 BC 预训练（utility/legacy 标签）
+│   ├── analyze_pool_candidates.py # 申请池规模 & worker 候选数分布诊断
 │   ├── train_worker_dqn.py      # legacy
 │   ├── train_requester_dqn.py   # legacy
 │   ├── evaluate.py          # 单策略评估
@@ -91,7 +93,7 @@
 | `candidate_feat` | K 个项目特征 (K×13) | K 个 worker 特征 (K×12) |
 | `action_mask` | 合法候选槽位 | 同上 |
 
-动态平台中 Worker-DQN 使用 `anchor_dim=12, candidate_dim=13`；Requester-DQN 使用 `anchor_dim=13, candidate_dim=12`，且动作 0 表示 `WAIT`。
+动态平台中 Worker-DQN 使用 `anchor_dim=12, candidate_dim=14`（`PLATFORM_PROJECT_FEAT_DIM`，含 `industry_match`）；Requester-DQN 使用 `anchor_dim=17, candidate_dim=12`（`REQUESTER_CONTEXT_FEAT_DIM`，含申请池 quality 统计 4 维），且动作 0 表示 `WAIT`。Legacy 环境仍为 13 维 project 特征，与 platform 维度分离。
 
 ---
 
@@ -111,11 +113,18 @@
 - [x] 报告大纲 `docs/report_outline.md`
 - [x] `include_truth_in_candidates` 消融（train/eval/baseline 已支持 CLI 开关）
 - [x] 学习曲线出图脚本（可从 `metrics.csv` 绘制）
-- [x] BC预训练 `scripts/pretrained_bc.py`
+- [x] BC预训练 `scripts/pretrained_bc.py`（legacy）
+- [x] Platform BC 预训练 `scripts/pretrained_platform_bc.py`
+- [x] Worker 混合召回（match / 热门 / 低等待 / 随机，`--no-mixed-recall` 可关）
+- [x] Requester 批量/延迟决策（默认 `batch_size=8`，`--immediate-requester-decision` 恢复旧行为）
+- [x] Platform 特征增强：`industry_match`、申请池 quality 统计（mean/max/std/top_gap）
+- [x] **Utility reward 模式**（默认 `--reward-mode utility`；`legacy` 为 hit 导向对照）
+- [x] 归一化/诊断指标：`platform_reward_per_project`、`platform_reward_per_step`、`worker/requester_recall_at_k`、`avg_requester_pool_size`、`avg_worker/requester_utility`
+- [x] 训练超参优化（2026-05-31）：全量默认、`worker/requester` 分离 batch/buffer/ε 衰减、checkpoint 指标补 requester hit
 
 ### 3.2 未完成（优先任务）
 
-- [ ] **全量数据**正式实验（`--max-projects 0`，足够 episode）
+- [ ] **Utility 模式**下全量重训 + test 基线（旧 checkpoint 与 `report_full_20260529` 不兼容）
 - [ ] 三种 DQN 变体系统对比并填入报告表
 - [ ] **实验报告正文**（PDF/Word）与 **PPT**
 - [ ] 持续维护 `docs/experiment_process.md`，只记录模型相关困难、调整目的、具体改变、指标变化与可能原因
@@ -166,8 +175,25 @@ python scripts/run_platform_baselines.py --split train --max-projects 50 --max-s
 # 数据
 python -m src.dataset --max-projects 50
 
-# 动态平台短训练
-python scripts/train_platform_dqn.py --max-projects 50 --episodes 1 --max-steps 100
+# 正式训练（默认全量 + utility + 分离超参）
+python scripts/pretrained_platform_bc.py --side worker  --max-projects 0 --episodes 5 --max-steps 0 --device cuda
+python scripts/pretrained_platform_bc.py --side requester --max-projects 0 --episodes 5 --max-steps 0 --device cuda
+python scripts/train_platform_dqn.py --device cuda \
+  --worker-pretrained runs/bc_platform/.../worker_best.pt \
+  --requester-pretrained runs/bc_platform/.../requester_best.pt
+
+# smoke（须显式缩数据/步数）
+python scripts/train_platform_dqn.py --max-projects 50 --episodes 2 --max-steps 100 --device cpu
+
+# 申请池 / 候选规模诊断
+python scripts/analyze_pool_candidates.py --split train --max-projects 50 --max-steps 200
+
+# Platform BC → DQN（utility 标签为候选内 argmax U）
+python scripts/pretrained_platform_bc.py --side worker --max-projects 50 --episodes 3
+python scripts/train_platform_dqn.py --max-projects 50 --episodes 5 --worker-pretrained runs/bc/.../best.pt
+
+# 复现旧 hit 导向实验
+python scripts/train_platform_dqn.py --reward-mode legacy --no-mixed-recall --immediate-requester-decision
 
 # legacy 评估
 python scripts/run_baselines.py --side worker --split test --max-projects 50
@@ -233,6 +259,29 @@ include_truth_in_candidates=True
 
 - 全量事件上万步；应用 `max_steps` 做调试，正式实验去掉步数上限。
 - 特征已用 `bisect` 优化历史查询；避免在 `step()` 里全表扫描。
+
+### 5.5 Platform 环境机制（2026-05-30 后）
+
+- **Reward 双模式**：`utility`（默认）用可观测利益 proxy 训练；`hit_rate` 仅诊断。`legacy` 复现旧 hit 导向实验。
+- **Requester 触发条件**（默认非即时）：申请池 ≥ `requester_batch_size`（8）/ 距 deadline ≤ `requester_deadline_buffer_hours`（24h）/ 池满 32 / deadline 强制。
+- **申请池过小**：即时选人时池子恒为 1；batch 模式下 train 上 `avg_requester_pool_size` 约 7–9。诊断：`python scripts/analyze_pool_candidates.py --max-projects 50 --max-steps 200`。
+- **`max_steps_per_episode` 未在 `step()` 内强制**：评估/诊断脚本须自行限制步数；`wait_until_deadline` 全 WAIT 时会无限循环。
+- **旧 checkpoint 不兼容**：特征 14/17 维 + batch requester + utility reward 均与 `runs/report_full_20260529` 不同，需重训。
+
+### 5.6 Platform DQN 训练超参（2026-05-31 默认）
+
+`train_platform_dqn.py` **不读取** `configs/default.yaml` 的 dqn 段；正式口径如下：
+
+| 项 | Worker | Requester |
+|----|--------|-----------|
+| `batch_size` | 64（`--worker-replay-batch`） | 32（`--requester-replay-batch`） |
+| `buffer_size` | 100000（`--worker-replay-buffer`） | 50000（`--requester-replay-buffer`） |
+| `epsilon_decay_steps` | **15000** | **8000**（按梯度步；全量约 ~1800/433 步/ep） |
+| `lr` | 3e-4 | 3e-4（`--requester-lr` 可单独设） |
+
+脚本默认：`max_projects=0`，`max_steps=0`，`episodes=20`，`device=cuda`。smoke 请加 `--max-projects 50 --max-steps 100 --device cpu`。
+
+Checkpoint（utility）：`worker_U + 5×requester_U + 0.05×worker_hit + 0.10×requester_hit + 0.02×requester_recall@k`。
 
 ---
 
@@ -327,4 +376,4 @@ include_truth_in_candidates=True
 
 ---
 
-*最后更新：与仓库实现同步（含 evaluate、baselines、双端 env、DQN 日志与 checkpoint）。*
+*最后更新：2026-05-31 — 含训练超参优化（分离 worker/requester、全量默认）。*

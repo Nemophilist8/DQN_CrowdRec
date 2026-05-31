@@ -11,30 +11,52 @@ import numpy as np
 
 from env.worker_env import Observation
 from src.dataset import ProjectRecord
-from src.features import PROJECT_FEAT_DIM, WORKER_FEAT_DIM, FeatureEncoder
+from src.features import (
+    PLATFORM_PROJECT_FEAT_DIM,
+    REQUESTER_CONTEXT_FEAT_DIM,
+    WORKER_FEAT_DIM,
+    FeatureEncoder,
+)
 from src.platform_dataset import PlatformDataset, PlatformWorkerEvent
 
 ActorName = Literal["worker", "requester"]
+RewardMode = Literal["utility", "legacy"]
 
 
 @dataclass
 class PlatformEnvConfig:
     num_project_candidates: int = 32
     num_worker_candidates: int = 32
-    hit_reward: float = 1.0
-    miss_penalty: float = -0.1
+    hit_reward: float = 3.0
+    miss_penalty: float = -0.5
     score_weight: float = 0.2
     quality_weight: float = 0.25
-    winner_bonus: float = 0.5
+    winner_bonus: float = 2.0
     finalist_bonus: float = 0.2
     category_match_weight: float = 0.15
     industry_match_weight: float = 0.1
-    award_weight: float = 0.02
-    urgency_weight: float = 0.05
+    award_weight: float = 0.01
+    urgency_weight: float = 0.02
     project_wait_penalty: float = 0.05
     include_truth_in_candidates: bool = False
+    mixed_recall: bool = True
     max_steps_per_episode: int | None = None
     release_delay_seconds: int = 1
+    # Requester 批量/延迟决策：默认攒够 batch 或临近 deadline 再触发
+    requester_immediate_decision: bool = False
+    requester_batch_size: int = 8
+    requester_deadline_buffer_hours: float = 24.0
+    # utility：最大化可观测利益 proxy；legacy：以历史 hit 为主（对照实验）
+    reward_mode: RewardMode = "utility"
+    utility_award_weight: float = 0.35
+    utility_worker_match_weight: float = 0.25
+    utility_worker_skill_weight: float = 0.25
+    utility_competition_weight: float = 0.15
+    utility_quality_weight: float = 0.40
+    utility_expected_score_weight: float = 0.35
+    utility_requester_match_weight: float = 0.15
+    utility_activity_weight: float = 0.10
+    legacy_hit_weight: float = 0.10
 
 
 @dataclass
@@ -144,6 +166,13 @@ class PlatformSimulationEnv:
             "winner_quality_sum": 0.0,
             "winner_count": 0.0,
             "steps": 0.0,
+            "worker_recall_opportunities": 0.0,
+            "worker_recalls": 0.0,
+            "requester_recall_opportunities": 0.0,
+            "requester_recalls": 0.0,
+            "requester_pool_size_sum": 0.0,
+            "worker_utility_sum": 0.0,
+            "requester_utility_sum": 0.0,
         }
         decision = self._advance()
         if decision is None:
@@ -162,13 +191,13 @@ class PlatformSimulationEnv:
             return Observation(
                 worker_feat=np.zeros(WORKER_FEAT_DIM, dtype=np.float32),
                 candidate_feat=np.zeros(
-                    (self.config.num_project_candidates, PROJECT_FEAT_DIM),
+                    (self.config.num_project_candidates, PLATFORM_PROJECT_FEAT_DIM),
                     dtype=np.float32,
                 ),
                 action_mask=np.zeros(self.config.num_project_candidates, dtype=bool),
             )
         return Observation(
-            worker_feat=np.zeros(PROJECT_FEAT_DIM, dtype=np.float32),
+            worker_feat=np.zeros(REQUESTER_CONTEXT_FEAT_DIM, dtype=np.float32),
             candidate_feat=np.zeros(
                 (self.config.num_worker_candidates + 1, WORKER_FEAT_DIM),
                 dtype=np.float32,
@@ -198,6 +227,23 @@ class PlatformSimulationEnv:
             "steps": steps,
             "worker_decisions": self.metrics["worker_decisions"],
             "requester_decisions": self.metrics["requester_decisions"],
+            "worker_recall_at_k": (
+                self.metrics["worker_recalls"]
+                / max(self.metrics["worker_recall_opportunities"], 1.0)
+            ),
+            "requester_recall_at_k": (
+                self.metrics["requester_recalls"]
+                / max(self.metrics["requester_recall_opportunities"], 1.0)
+            ),
+            "platform_reward_per_project": self.metrics["platform_reward"] / closed,
+            "platform_reward_per_step": self.metrics["platform_reward"] / steps,
+            "avg_requester_pool_size": (
+                self.metrics["requester_pool_size_sum"] / requester_steps
+            ),
+            "avg_worker_utility": self.metrics["worker_utility_sum"] / worker_steps,
+            "avg_requester_utility": (
+                self.metrics["requester_utility_sum"] / requester_steps
+            ),
         }
 
     def _step_worker(self, action: int) -> PlatformStep:
@@ -205,6 +251,7 @@ class PlatformSimulationEnv:
         ev = self._current_worker_event
         worker_reward = self.config.miss_penalty
         worker_hit = False
+        worker_utility = 0.0
         selected_project_id: int | None = None
 
         if 0 <= action < len(self._candidate_project_ids):
@@ -214,7 +261,7 @@ class PlatformSimulationEnv:
                 state.applicants.append(ev.worker_id)
                 state.applicant_times[ev.worker_id] = ev.timestamp
                 self.worker_busy_project[ev.worker_id] = selected_project_id
-                worker_reward, worker_hit = self._worker_reward(
+                worker_reward, worker_hit, worker_utility = self._worker_reward(
                     ev.worker_id,
                     selected_project_id,
                     ev.timestamp,
@@ -225,6 +272,7 @@ class PlatformSimulationEnv:
         self.metrics["worker_reward"] += worker_reward
         self.metrics["platform_reward"] += worker_reward
         self.metrics["worker_hits"] += float(worker_hit)
+        self.metrics["worker_utility_sum"] += worker_utility
         self.metrics["steps"] += 1
 
         info = {
@@ -243,21 +291,76 @@ class PlatformSimulationEnv:
         }
 
         if selected_project_id is not None:
-            self._current_requester_project_id = selected_project_id
-            self._requester_deadline_forced = self._is_deadline_forced(
-                selected_project_id
-            )
-            next_decision = self._make_requester_decision(selected_project_id)
+            if self._should_trigger_requester(selected_project_id, ev.timestamp):
+                self._current_requester_project_id = selected_project_id
+                self._requester_deadline_forced = self._is_deadline_forced(
+                    selected_project_id
+                )
+                next_decision = self._make_requester_decision(selected_project_id)
+            else:
+                next_decision = self._advance()
         else:
             next_decision = self._advance()
         return self._finish_step("worker", worker_reward, info, next_decision)
+
+    def _build_requester_worker_pool(
+        self,
+        project_id: int,
+        applicants: list[int],
+        t: datetime,
+    ) -> list[int]:
+        """申请池 worker 召回：优先保留历史 winner，再按质量/活跃度补齐。"""
+        if not applicants:
+            return []
+
+        k = self.config.num_worker_candidates
+        winner_ids = [
+            wid
+            for wid in applicants
+            if self.platform.outcome_for(project_id, wid).winner
+        ]
+        ranked = sorted(
+            applicants,
+            key=lambda wid: (
+                -self.dataset.get_worker_quality(wid),
+                -self.encoder.worker_history_profile(wid, t).past_count,
+                wid,
+            ),
+        )
+
+        chosen: list[int] = []
+        seen: set[int] = set()
+        for wid in winner_ids + ranked:
+            if wid in seen:
+                continue
+            seen.add(wid)
+            chosen.append(wid)
+            if len(chosen) >= k:
+                break
+        return chosen
 
     def _step_requester(self, action: int) -> PlatformStep:
         assert self._current_requester_project_id is not None
         pid = self._current_requester_project_id
         state = self.project_states[pid]
+        winner_in_applicants = any(
+            self.platform.outcome_for(pid, wid).winner for wid in state.applicants
+        )
+        if winner_in_applicants:
+            self.metrics["requester_recall_opportunities"] += 1.0
+            candidate_workers = [
+                wid
+                for wid in self._requester_candidate_worker_ids[1:]
+                if wid is not None
+            ]
+            if any(
+                self.platform.outcome_for(pid, wid).winner for wid in candidate_workers
+            ):
+                self.metrics["requester_recalls"] += 1.0
+
         requester_reward = self.config.miss_penalty
         requester_hit = False
+        requester_utility = 0.0
         selected_worker_id: int | None = None
         wait_cost = 0.0
 
@@ -276,10 +379,12 @@ class PlatformSimulationEnv:
                     pid,
                     self.current_time_or_project_time(pid),
                 )
-                requester_reward, requester_hit = self._requester_reward(
-                    pid,
-                    selected_worker_id,
-                    self.current_time_or_project_time(pid),
+                requester_reward, requester_hit, requester_utility = (
+                    self._requester_reward(
+                        pid,
+                        selected_worker_id,
+                        self.current_time_or_project_time(pid),
+                    )
                 )
                 self._close_project(pid, selected_worker_id)
         else:
@@ -292,6 +397,7 @@ class PlatformSimulationEnv:
         self.metrics["requester_reward"] += requester_reward
         self.metrics["platform_reward"] += platform_reward
         self.metrics["requester_hits"] += float(requester_hit)
+        self.metrics["requester_utility_sum"] += requester_utility
         self.metrics["steps"] += 1
 
         info = {
@@ -335,23 +441,54 @@ class PlatformSimulationEnv:
 
     def _advance(self) -> PlatformDecision | None:
         while True:
-            next_event_time = self._event_heap[0][0] if self._event_heap else None
-            due_pid = self._next_due_project(next_event_time)
-            if due_pid is not None:
-                project = self.project_states[due_pid].project
-                self.current_time = max(project.deadline, self.current_time or project.deadline)
-                if self.project_states[due_pid].applicants:
-                    self._current_requester_project_id = due_pid
-                    self._requester_deadline_forced = True
-                    return self._make_requester_decision(due_pid)
-                self._close_unfilled(due_pid, self.current_time)
-                continue
+            next_worker_time = self._event_heap[0][0] if self._event_heap else None
+            due_pid = self._next_due_project(next_worker_time)
+            due_time = (
+                self.project_states[due_pid].project.deadline if due_pid is not None else None
+            )
+            buffer_item = self._next_buffer_requester_project(next_worker_time)
+            buffer_pid, buffer_time = buffer_item if buffer_item else (None, None)
 
-            if not self._event_heap:
+            candidates: list[tuple[str, datetime, int | None]] = []
+            if due_pid is not None and due_time is not None:
+                candidates.append(("deadline", due_time, due_pid))
+            if buffer_pid is not None and buffer_time is not None:
+                candidates.append(("buffer", buffer_time, buffer_pid))
+            if next_worker_time is not None:
+                candidates.append(("worker", next_worker_time, None))
+
+            if not candidates:
                 tail_pid = self._next_due_project(None)
                 if tail_pid is None:
                     return None
                 continue
+
+            candidates.sort(key=lambda item: (item[1], 0 if item[0] == "deadline" else 1))
+            kind, event_time, project_id = candidates[0]
+
+            if kind == "deadline":
+                assert project_id is not None
+                project = self.project_states[project_id].project
+                self.current_time = max(
+                    project.deadline,
+                    self.current_time or project.deadline,
+                )
+                if self.project_states[project_id].applicants:
+                    self._current_requester_project_id = project_id
+                    self._requester_deadline_forced = True
+                    return self._make_requester_decision(project_id)
+                self._close_unfilled(project_id, self.current_time)
+                continue
+
+            if kind == "buffer":
+                assert project_id is not None
+                self.current_time = max(
+                    event_time,
+                    self.current_time or event_time,
+                )
+                self._current_requester_project_id = project_id
+                self._requester_deadline_forced = self._is_deadline_forced(project_id)
+                return self._make_requester_decision(project_id)
 
             _, _, ev = heapq.heappop(self._event_heap)
             self.current_time = ev.timestamp
@@ -363,13 +500,63 @@ class PlatformSimulationEnv:
                 continue
             return decision
 
+    def _should_trigger_requester(self, project_id: int, t: datetime) -> bool:
+        """是否触发 requester 决策（批量/延迟机制）。"""
+        if self.config.requester_immediate_decision:
+            return True
+
+        state = self.project_states[project_id]
+        if not state.applicants:
+            return False
+        if self._is_deadline_forced(project_id):
+            return True
+        if len(state.applicants) >= self.config.requester_batch_size:
+            return True
+        if len(state.applicants) >= self.config.num_worker_candidates:
+            return True
+
+        hours_left = max(
+            (state.project.deadline - t).total_seconds() / 3600.0,
+            0.0,
+        )
+        return hours_left <= self.config.requester_deadline_buffer_hours
+
+    def _next_buffer_requester_project(
+        self,
+        before_time: datetime | None,
+    ) -> tuple[int, datetime] | None:
+        """找最早到达 deadline buffer 且申请池非空、尚未到 deadline 的 project。"""
+        if self.config.requester_immediate_decision:
+            return None
+
+        best: tuple[int, datetime] | None = None
+        buffer_delta = timedelta(hours=self.config.requester_deadline_buffer_hours)
+        for pid, state in self.project_states.items():
+            if state.closed or not state.applicants:
+                continue
+            deadline = state.project.deadline
+            trigger_at = deadline - buffer_delta
+            if trigger_at >= deadline:
+                continue
+            if before_time is not None and trigger_at > before_time:
+                continue
+            if best is None or trigger_at < best[1] or (
+                trigger_at == best[1] and pid < best[0]
+            ):
+                best = (pid, trigger_at)
+        return best
+
     def _make_worker_decision(
         self,
         ev: PlatformWorkerEvent,
     ) -> PlatformDecision | None:
-        candidates = self._build_project_candidates(ev)
+        candidates, recall_info = self._build_project_candidates(ev)
         if not candidates:
             return None
+        if recall_info["truth_active"]:
+            self.metrics["worker_recall_opportunities"] += 1.0
+        if recall_info["truth_in_candidates"]:
+            self.metrics["worker_recalls"] += 1.0
         self._current_worker_event = ev
         self._candidate_project_ids = [p.project_id for p in candidates]
         obs = self._observe_worker(ev, candidates)
@@ -379,12 +566,15 @@ class PlatformSimulationEnv:
             "timestamp": ev.timestamp.isoformat(),
             "truth_project_id": ev.truth_project_id,
             "candidate_project_ids": list(self._candidate_project_ids),
+            "truth_in_candidates": recall_info["truth_in_candidates"],
         }
         decision = PlatformDecision("worker", obs, info)
         self.current_decision = decision
         return decision
 
     def _make_requester_decision(self, project_id: int) -> PlatformDecision:
+        pool_size = len(self.project_states[project_id].applicants)
+        self.metrics["requester_pool_size_sum"] += float(pool_size)
         obs = self._observe_requester(project_id)
         info = {
             "actor": "requester",
@@ -392,6 +582,8 @@ class PlatformSimulationEnv:
             "timestamp": self.current_time_or_project_time(project_id).isoformat(),
             "deadline_forced": self._requester_deadline_forced,
             "candidate_worker_ids": list(self._requester_candidate_worker_ids),
+            "applicant_pool_size": pool_size,
+            "batch_triggered": pool_size >= self.config.requester_batch_size,
         }
         decision = PlatformDecision("requester", obs, info)
         self.current_decision = decision
@@ -400,7 +592,7 @@ class PlatformSimulationEnv:
     def _build_project_candidates(
         self,
         ev: PlatformWorkerEvent,
-    ) -> list[ProjectRecord]:
+    ) -> tuple[list[ProjectRecord], dict[str, bool]]:
         t = ev.timestamp
         k = self.config.num_project_candidates
         active: list[ProjectRecord] = []
@@ -420,19 +612,115 @@ class PlatformSimulationEnv:
                 continue
             active.append(p)
 
-        active.sort(
-            key=lambda p: (
-                -self._project_wait_days(p.project_id, t),
-                -p.entry_count,
-                -p.total_awards,
-                p.project_id,
-            )
+        truth_active = ev.truth_project_id is not None and (
+            truth_project is not None
+            or any(p.project_id == ev.truth_project_id for p in active)
         )
-        chosen = active[: k - (1 if truth_project is not None else 0)]
+        reserve = 1 if truth_project is not None else 0
+        target_size = k - reserve
+
+        if self.config.mixed_recall and not self.config.include_truth_in_candidates:
+            chosen = self._mixed_project_recall(ev, active, t, target_size)
+        else:
+            active.sort(
+                key=lambda p: (
+                    -self._project_wait_days(p.project_id, t),
+                    -p.entry_count,
+                    -p.total_awards,
+                    p.project_id,
+                )
+            )
+            chosen = active[:target_size]
+
         if truth_project is not None:
             chosen.append(truth_project)
             self.rng.shuffle(chosen)
-        return chosen[:k]
+
+        chosen = chosen[:k]
+        truth_in_candidates = ev.truth_project_id is not None and any(
+            p.project_id == ev.truth_project_id for p in chosen
+        )
+        return chosen, {
+            "truth_active": truth_active,
+            "truth_in_candidates": truth_in_candidates,
+        }
+
+    def _mixed_project_recall(
+        self,
+        ev: PlatformWorkerEvent,
+        active: list[ProjectRecord],
+        t: datetime,
+        target_size: int,
+    ) -> list[ProjectRecord]:
+        """混合召回：匹配 / 热门 / 低等待 / 随机各占一部分槽位。"""
+        if not active:
+            return []
+
+        profile = self.encoder.worker_history_profile(ev.worker_id, t)
+        chosen: list[ProjectRecord] = []
+        chosen_ids: set[int] = set()
+        quarter = max(target_size // 4, 1)
+
+        def take(projects: list[ProjectRecord], limit: int) -> None:
+            for project in projects:
+                if len(chosen) >= target_size or limit <= 0:
+                    return
+                if project.project_id in chosen_ids:
+                    continue
+                chosen_ids.add(project.project_id)
+                chosen.append(project)
+                limit -= 1
+
+        match_pool = sorted(
+            active,
+            key=lambda p: (
+                -float(
+                    profile.dominant_category is not None
+                    and p.category == profile.dominant_category
+                ),
+                -float(
+                    profile.dominant_industry_id is not None
+                    and p.industry_id == profile.dominant_industry_id
+                ),
+                -self._project_wait_days(p.project_id, t),
+                -p.entry_count,
+                p.project_id,
+            ),
+        )
+        take(match_pool, quarter)
+
+        popularity_pool = sorted(
+            active,
+            key=lambda p: (-p.entry_count, -p.total_awards, p.project_id),
+        )
+        take(popularity_pool, quarter)
+
+        low_wait_pool = sorted(
+            active,
+            key=lambda p: (
+                -self._project_wait_days(p.project_id, t),
+                -p.entry_count,
+                p.project_id,
+            ),
+        )
+        take(low_wait_pool, quarter)
+
+        remaining = [p for p in active if p.project_id not in chosen_ids]
+        self.rng.shuffle(remaining)
+        take(remaining, quarter)
+
+        if len(chosen) < target_size:
+            filler = sorted(
+                active,
+                key=lambda p: (
+                    -self._project_wait_days(p.project_id, t),
+                    -p.entry_count,
+                    -p.total_awards,
+                    p.project_id,
+                ),
+            )
+            take(filler, target_size - len(chosen))
+        return chosen
 
     def _observe_worker(
         self,
@@ -441,7 +729,7 @@ class PlatformSimulationEnv:
     ) -> Observation:
         k = self.config.num_project_candidates
         worker_feat = self.encoder.worker_features(ev.worker_id, ev.timestamp)
-        cand_feat = np.zeros((k, PROJECT_FEAT_DIM), dtype=np.float32)
+        cand_feat = np.zeros((k, PLATFORM_PROJECT_FEAT_DIM), dtype=np.float32)
         mask = np.zeros(k, dtype=bool)
         profile = self.encoder.worker_history_profile(ev.worker_id, ev.timestamp)
         for i, project in enumerate(candidates[:k]):
@@ -459,7 +747,11 @@ class PlatformSimulationEnv:
         project = state.project
         k = self.config.num_worker_candidates + 1
         t = self.current_time_or_project_time(project_id)
-        context_feat = self._platform_project_context_features(project, t)
+        context_feat = self._platform_project_context_features(
+            project,
+            t,
+            state.applicants,
+        )
         cand_feat = np.zeros((k, WORKER_FEAT_DIM), dtype=np.float32)
         mask = np.zeros(k, dtype=bool)
 
@@ -467,15 +759,8 @@ class PlatformSimulationEnv:
         cand_feat[0, -1] = 1.0
         mask[0] = not self._requester_deadline_forced
 
-        workers = sorted(
-            state.applicants,
-            key=lambda wid: (
-                -self.dataset.get_worker_quality(wid),
-                -self.encoder.worker_history_profile(wid, t).past_count,
-                wid,
-            ),
-        )
-        for wid in workers[: self.config.num_worker_candidates]:
+        workers = self._build_requester_worker_pool(project_id, state.applicants, t)
+        for wid in workers:
             self._requester_candidate_worker_ids.append(wid)
 
         for i, wid in enumerate(self._requester_candidate_worker_ids[1:], start=1):
@@ -492,7 +777,13 @@ class PlatformSimulationEnv:
         profile: Any,
     ) -> np.ndarray:
         dom_cat = profile.dominant_category
+        dom_industry = profile.dominant_industry_id
         cat_match = 1.0 if dom_cat is not None and project.category == dom_cat else 0.0
+        industry_match = (
+            1.0
+            if dom_industry is not None and project.industry_id == dom_industry
+            else 0.0
+        )
         hours_left = max((project.deadline - t).total_seconds() / 3600.0, 0.0)
         hours_open = max((t - project.start_date).total_seconds() / 3600.0, 0.0)
         fill_ratio = self._fill_ratio(project.project_id)
@@ -510,6 +801,7 @@ class PlatformSimulationEnv:
                 np.log1p(hours_left) / 10.0,
                 np.log1p(hours_open) / 10.0,
                 cat_match,
+                industry_match,
                 fill_ratio,
                 remaining_ratio,
                 np.log1p(wait_days),
@@ -517,17 +809,37 @@ class PlatformSimulationEnv:
             dtype=np.float32,
         )
 
+    @staticmethod
+    def _applicant_pool_quality_stats(
+        dataset: Any,
+        applicants: list[int],
+    ) -> tuple[float, float, float, float]:
+        """申请池质量统计：均值、最大值、标准差、top 与均值差距。"""
+        if not applicants:
+            return 0.0, 0.0, 0.0, 0.0
+        qualities = np.array(
+            [dataset.get_worker_quality(wid) for wid in applicants],
+            dtype=np.float32,
+        )
+        mean_q = float(qualities.mean())
+        max_q = float(qualities.max())
+        std_q = float(qualities.std()) if len(qualities) > 1 else 0.0
+        return mean_q, max_q, std_q, max_q - mean_q
+
     def _platform_project_context_features(
         self,
         project: ProjectRecord,
         t: datetime,
+        applicants: list[int],
     ) -> np.ndarray:
         hours_left = max((project.deadline - t).total_seconds() / 3600.0, 0.0)
         hours_open = max((t - project.start_date).total_seconds() / 3600.0, 0.0)
         fill_ratio = self._fill_ratio(project.project_id)
         remaining_ratio = max(1.0 - fill_ratio, 0.0)
         wait_days = self._project_wait_days(project.project_id, t)
-        applicants = len(self.project_states[project.project_id].applicants)
+        pool_mean_q, pool_max_q, pool_std_q, pool_top_gap = (
+            self._applicant_pool_quality_stats(self.dataset, applicants)
+        )
         return np.array(
             [
                 project.category / 20.0,
@@ -542,22 +854,104 @@ class PlatformSimulationEnv:
                 fill_ratio,
                 remaining_ratio,
                 np.log1p(wait_days),
-                np.log1p(applicants) / 5.0,
+                np.log1p(len(applicants)) / 5.0,
+                pool_mean_q,
+                pool_max_q,
+                pool_std_q,
+                pool_top_gap,
             ],
             dtype=np.float32,
         )
 
-    def _worker_reward(
+    def _compute_worker_utility(
+        self,
+        worker_id: int,
+        project_id: int,
+        t: datetime,
+    ) -> float:
+        """参与者利益 proxy：奖金、匹配、类目能力，扣除竞争压力。"""
+        project = self.project_states[project_id].project
+        profile = self.encoder.worker_history_profile(worker_id, t)
+        cat_score, cat_win_rate, _ = self.encoder.worker_category_stats(
+            worker_id,
+            project.category,
+            t,
+        )
+        cat_match = (
+            1.0
+            if profile.dominant_category is not None
+            and project.category == profile.dominant_category
+            else 0.0
+        )
+        ind_match = (
+            1.0
+            if profile.dominant_industry_id is not None
+            and project.industry_id == profile.dominant_industry_id
+            else 0.0
+        )
+        skill = 0.5 * (cat_score / 5.0) + 0.5 * cat_win_rate
+        if profile.past_count == 0:
+            skill = 0.5 * (profile.mean_score / 5.0) + 0.5 * profile.win_rate
+        competition = min(
+            np.log1p(max(project.entry_count, 0.0)) / 10.0,
+            1.0,
+        )
+        return float(
+            self.config.utility_award_weight
+            * min(np.log1p(max(project.total_awards, 0.0)) / 10.0, 1.0)
+            + self.config.utility_worker_match_weight * (0.6 * cat_match + 0.4 * ind_match)
+            + self.config.utility_worker_skill_weight * skill
+            - self.config.utility_competition_weight * competition
+        )
+
+    def _compute_requester_utility(
+        self,
+        project_id: int,
+        worker_id: int,
+        t: datetime,
+    ) -> float:
+        """发布者利益 proxy：质量、预期分数、匹配与活跃度。"""
+        project = self.project_states[project_id].project
+        profile = self.encoder.worker_history_profile(worker_id, t)
+        cat_score, _, _ = self.encoder.worker_category_stats(
+            worker_id,
+            project.category,
+            t,
+        )
+        expected_score = cat_score if cat_score > 0 else profile.mean_score
+        cat_match = (
+            1.0
+            if profile.dominant_category is not None
+            and project.category == profile.dominant_category
+            else 0.0
+        )
+        ind_match = (
+            1.0
+            if profile.dominant_industry_id is not None
+            and project.industry_id == profile.dominant_industry_id
+            else 0.0
+        )
+        activity = min(np.log1p(profile.past_count) / 5.0, 1.0)
+        return float(
+            self.config.utility_quality_weight
+            * self.dataset.get_worker_quality(worker_id)
+            + self.config.utility_expected_score_weight * (expected_score / 5.0)
+            + self.config.utility_requester_match_weight
+            * (0.6 * cat_match + 0.4 * ind_match)
+            + self.config.utility_activity_weight * activity
+        )
+
+    def _legacy_worker_reward(
         self,
         worker_id: int,
         project_id: int,
         t: datetime,
         truth_project_id: int | None,
-    ) -> tuple[float, bool]:
-        project = self.project_states[project_id].project
-        outcome = self.platform.outcome_for(project_id, worker_id)
-        profile = self.encoder.worker_history_profile(worker_id, t)
-        hit = outcome.submitted or truth_project_id == project_id
+        hit: bool,
+        outcome: Any,
+        profile: Any,
+        project: ProjectRecord,
+    ) -> float:
         reward = self.config.hit_reward if hit else self.config.miss_penalty
         reward += self.config.score_weight * (outcome.max_revision_score / 5.0)
         if outcome.winner:
@@ -571,17 +965,16 @@ class PlatformSimulationEnv:
         reward += self.config.award_weight * np.log1p(max(project.total_awards, 0.0))
         hours_left = max((project.deadline - t).total_seconds() / 3600.0, 0.0)
         reward += self.config.urgency_weight * min(np.log1p(hours_left) / 10.0, 1.0)
-        return float(reward), hit
+        return float(reward)
 
-    def _requester_reward(
+    def _legacy_requester_reward(
         self,
         project_id: int,
         worker_id: int,
-        t: datetime,
-    ) -> tuple[float, bool]:
-        project = self.project_states[project_id].project
-        outcome = self.platform.outcome_for(project_id, worker_id)
-        profile = self.encoder.worker_history_profile(worker_id, t)
+        outcome: Any,
+        profile: Any,
+        project: ProjectRecord,
+    ) -> float:
         reward = self.config.quality_weight * self.dataset.get_worker_quality(worker_id)
         reward += self.config.score_weight * (outcome.max_revision_score / 5.0)
         if outcome.winner:
@@ -592,7 +985,63 @@ class PlatformSimulationEnv:
             reward += self.config.category_match_weight
         if profile.dominant_industry_id == project.industry_id:
             reward += self.config.industry_match_weight
-        return float(reward), outcome.winner
+        return float(reward)
+
+    def _worker_reward(
+        self,
+        worker_id: int,
+        project_id: int,
+        t: datetime,
+        truth_project_id: int | None,
+    ) -> tuple[float, bool, float]:
+        project = self.project_states[project_id].project
+        outcome = self.platform.outcome_for(project_id, worker_id)
+        profile = self.encoder.worker_history_profile(worker_id, t)
+        hit = outcome.submitted or truth_project_id == project_id
+        utility = self._compute_worker_utility(worker_id, project_id, t)
+
+        if self.config.reward_mode == "utility":
+            reward = utility
+            if hit:
+                reward += self.config.legacy_hit_weight
+        else:
+            reward = self._legacy_worker_reward(
+                worker_id,
+                project_id,
+                t,
+                truth_project_id,
+                hit,
+                outcome,
+                profile,
+                project,
+            )
+        return float(reward), hit, utility
+
+    def _requester_reward(
+        self,
+        project_id: int,
+        worker_id: int,
+        t: datetime,
+    ) -> tuple[float, bool, float]:
+        project = self.project_states[project_id].project
+        outcome = self.platform.outcome_for(project_id, worker_id)
+        profile = self.encoder.worker_history_profile(worker_id, t)
+        hit = outcome.winner
+        utility = self._compute_requester_utility(project_id, worker_id, t)
+
+        if self.config.reward_mode == "utility":
+            reward = utility
+            if hit:
+                reward += self.config.legacy_hit_weight
+        else:
+            reward = self._legacy_requester_reward(
+                project_id,
+                worker_id,
+                outcome,
+                profile,
+                project,
+            )
+        return float(reward), hit, utility
 
     def _apply_wait_cost(self, project_id: int, end_time: datetime) -> float:
         state = self.project_states[project_id]
@@ -682,3 +1131,86 @@ class PlatformSimulationEnv:
         if self.current_time is not None:
             return self.current_time
         return self.project_states[project_id].project.start_date
+
+    def optimal_worker_action(self, truth_project_id: int | None) -> int | None:
+        """BC / 评估标签：utility 模式下为候选内 U_worker 最大；legacy 为 truth index。"""
+        if not self._candidate_project_ids:
+            return None
+        if self.config.reward_mode == "legacy":
+            if truth_project_id is None:
+                return None
+            for idx, pid in enumerate(self._candidate_project_ids):
+                if pid == truth_project_id:
+                    return idx
+            return None
+
+        assert self._current_worker_event is not None
+        ev = self._current_worker_event
+        best_idx: int | None = None
+        best_u = float("-inf")
+        for idx, pid in enumerate(self._candidate_project_ids):
+            u = self._compute_worker_utility(ev.worker_id, pid, ev.timestamp)
+            if u > best_u:
+                best_u = u
+                best_idx = idx
+        return best_idx
+
+    def optimal_requester_action(self, project_id: int) -> int | None:
+        """BC 标签：utility 模式下为申请池候选内 U_requester 最大；legacy 为历史 winner。"""
+        if self.config.reward_mode == "legacy":
+            for idx, wid in enumerate(self._requester_candidate_worker_ids):
+                if idx == 0 or wid is None:
+                    continue
+                if self.platform.outcome_for(project_id, wid).winner:
+                    return idx
+            return None
+
+        t = self.current_time_or_project_time(project_id)
+        best_idx: int | None = None
+        best_u = float("-inf")
+        for idx, wid in enumerate(self._requester_candidate_worker_ids):
+            if idx == 0 or wid is None:
+                continue
+            u = self._compute_requester_utility(project_id, wid, t)
+            if u > best_u:
+                best_u = u
+                best_idx = idx
+        return best_idx
+
+
+def add_platform_env_cli_args(parser: Any) -> None:
+    """向 argparse 注册 platform 环境相关参数。"""
+    parser.add_argument(
+        "--reward-mode",
+        choices=["utility", "legacy"],
+        default="utility",
+        help="utility=利益 proxy 为主；legacy=历史 hit 为主",
+    )
+    parser.add_argument("--immediate-requester-decision", action="store_true")
+    parser.add_argument("--requester-batch-size", type=int, default=8)
+    parser.add_argument("--requester-deadline-buffer-hours", type=float, default=24.0)
+    parser.add_argument("--no-mixed-recall", action="store_true")
+
+
+def platform_env_config_from_args(args: Any, **overrides: Any) -> PlatformEnvConfig:
+    """从 CLI 参数构造 PlatformEnvConfig。"""
+    cfg = PlatformEnvConfig(
+        num_project_candidates=getattr(args, "num_project_candidates", 32),
+        num_worker_candidates=getattr(args, "num_worker_candidates", 32),
+        include_truth_in_candidates=getattr(args, "include_truth_in_candidates", False),
+        mixed_recall=not getattr(args, "no_mixed_recall", False),
+        project_wait_penalty=getattr(args, "project_wait_penalty", 0.05),
+        reward_mode=getattr(args, "reward_mode", "utility"),
+        requester_immediate_decision=getattr(
+            args, "immediate_requester_decision", False
+        ),
+        requester_batch_size=getattr(args, "requester_batch_size", 8),
+        requester_deadline_buffer_hours=getattr(
+            args, "requester_deadline_buffer_hours", 24.0
+        ),
+        max_steps_per_episode=overrides.pop("max_steps_per_episode", None),
+    )
+    for key, value in overrides.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg

@@ -344,7 +344,8 @@ class DQNAgent:
     def load(self, path: str | Path, *, load_optimizer: bool = True) -> dict[str, Any]:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy_net.load_state_dict(ckpt["policy"])
-        self.target_net.load_state_dict(ckpt["target"])
+        target_state = ckpt.get("target", ckpt["policy"])
+        self.target_net.load_state_dict(target_state)
         if load_optimizer and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         self._step_count = int(ckpt.get("step", 0))

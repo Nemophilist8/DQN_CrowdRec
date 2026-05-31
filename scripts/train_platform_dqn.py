@@ -10,39 +10,119 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from env.platform_env import PlatformEnvConfig, PlatformSimulationEnv
+from env.platform_env import (
+    PlatformSimulationEnv,
+    add_platform_env_cli_args,
+    platform_env_config_from_args,
+)
 from models.platform_training import run_platform_episode
 from models.training_log import TrainingLogger
 from src.config import Config, load_config
 from src.dataset import build_dataset
-from src.features import PROJECT_FEAT_DIM, WORKER_FEAT_DIM
+from src.features import (
+    PLATFORM_PROJECT_FEAT_DIM,
+    REQUESTER_CONTEXT_FEAT_DIM,
+    WORKER_FEAT_DIM,
+)
 from src.platform_dataset import PlatformDataset
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train dynamic platform DQN")
-    parser.add_argument("--max-projects", type=int, default=100)
-    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument(
+        "--max-projects",
+        type=int,
+        default=0,
+        help="0=全量；调试可设 50/100",
+    )
+    parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--num-project-candidates", type=int, default=32)
     parser.add_argument("--num-worker-candidates", type=int, default=32)
-    parser.add_argument("--worker-model", choices=["dqn", "dueling"], default="dqn")
-    parser.add_argument("--requester-model", choices=["dqn", "dueling"], default="dqn")
-    parser.add_argument("--worker-double-dqn", action="store_true")
-    parser.add_argument("--requester-double-dqn", action="store_true")
     parser.add_argument("--include-truth-in-candidates", action="store_true")
     parser.add_argument("--project-wait-penalty", type=float, default=0.05)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--buffer-size", type=int, default=10_000)
+    add_platform_env_cli_args(parser)
+    parser.add_argument("--worker-pretrained", type=str, default=None)
+    parser.add_argument("--requester-pretrained", type=str, default=None)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--requester-lr", type=float, default=None)
+    parser.add_argument("--worker-replay-batch", type=int, default=64)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="若指定则同时覆盖 worker/requester replay batch（兼容旧 CLI）",
+    )
+    parser.add_argument("--requester-replay-batch", type=int, default=32)
+    parser.add_argument("--worker-replay-buffer", type=int, default=100_000)
+    parser.add_argument("--requester-replay-buffer", type=int, default=50_000)
+    parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=None,
+        help="若指定则同时覆盖 worker/requester replay buffer（兼容旧 CLI）",
+    )
     parser.add_argument("--target-update-freq", type=int, default=200)
-    parser.add_argument("--epsilon-decay-steps", type=int, default=1_000)
-    parser.add_argument("--epsilon-end", type=float, default=0.05)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--max-steps", type=int, default=800)
+    parser.add_argument(
+        "--epsilon-decay-steps",
+        type=int,
+        default=15_000,
+        help="worker ε 衰减步数（按梯度更新计）",
+    )
+    parser.add_argument("--requester-epsilon-decay-steps", type=int, default=8_000)
+    parser.add_argument("--epsilon-end", type=float, default=0.01)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="0=完整 episode；调试可设 100/800",
+    )
     parser.add_argument("--update-every", type=int, default=4)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--log-dir", default="runs/platform")
+    parser.add_argument("--worker-model", choices=["dqn", "dueling"], default="dueling")
+    parser.add_argument("--requester-model", choices=["dqn", "dueling"], default="dueling")
+    parser.add_argument(
+        "--worker-double-dqn",
+        dest="worker_double_dqn",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-worker-double-dqn",
+        dest="worker_double_dqn",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--requester-double-dqn",
+        dest="requester_double_dqn",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-requester-double-dqn",
+        dest="requester_double_dqn",
+        action="store_false",
+    )
     args = parser.parse_args()
+
+    worker_batch = (
+        args.batch_size if args.batch_size is not None else args.worker_replay_batch
+    )
+    requester_batch = (
+        args.batch_size
+        if args.batch_size is not None
+        else args.requester_replay_batch
+    )
+    worker_buffer = (
+        args.buffer_size if args.buffer_size is not None else args.worker_replay_buffer
+    )
+    requester_buffer = (
+        args.buffer_size
+        if args.buffer_size is not None
+        else args.requester_replay_buffer
+    )
+    requester_lr = args.lr if args.requester_lr is None else args.requester_lr
 
     try:
         from models.dqn import DQNAgent, DQNConfig
@@ -57,11 +137,8 @@ def main() -> None:
     ds = build_with_limit(args.max_projects)
     train_platform = PlatformDataset(ds, "train")
     val_platform = PlatformDataset(ds, "val")
-    env_cfg = PlatformEnvConfig(
-        num_project_candidates=args.num_project_candidates,
-        num_worker_candidates=args.num_worker_candidates,
-        project_wait_penalty=args.project_wait_penalty,
-        include_truth_in_candidates=args.include_truth_in_candidates,
+    env_cfg = platform_env_config_from_args(
+        args,
         max_steps_per_episode=None if args.max_steps == 0 else args.max_steps,
     )
 
@@ -73,25 +150,25 @@ def main() -> None:
         double_dqn=args.worker_double_dqn,
         device=args.device,
         lr=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
+        batch_size=worker_batch,
+        buffer_size=worker_buffer,
         target_update_freq=args.target_update_freq,
         epsilon_decay_steps=args.epsilon_decay_steps,
         epsilon_end=args.epsilon_end,
         anchor_dim=WORKER_FEAT_DIM,
-        candidate_dim=PROJECT_FEAT_DIM,
+        candidate_dim=PLATFORM_PROJECT_FEAT_DIM,
     )
     requester_cfg = DQNConfig(
         model_type=args.requester_model,
         double_dqn=args.requester_double_dqn,
         device=args.device,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
+        lr=requester_lr,
+        batch_size=requester_batch,
+        buffer_size=requester_buffer,
         target_update_freq=args.target_update_freq,
-        epsilon_decay_steps=args.epsilon_decay_steps,
+        epsilon_decay_steps=args.requester_epsilon_decay_steps,
         epsilon_end=args.epsilon_end,
-        anchor_dim=PROJECT_FEAT_DIM,
+        anchor_dim=REQUESTER_CONTEXT_FEAT_DIM,
         candidate_dim=WORKER_FEAT_DIM,
     )
     worker_agent = DQNAgent(
@@ -103,8 +180,21 @@ def main() -> None:
         config=requester_cfg,
     )
 
+    if args.worker_pretrained:
+        worker_agent.load(args.worker_pretrained, load_optimizer=False)
+        worker_agent.sync_target()
+        print(f"已加载 worker 预训练: {args.worker_pretrained}", flush=True)
+    if args.requester_pretrained:
+        requester_agent.load(args.requester_pretrained, load_optimizer=False)
+        requester_agent.sync_target()
+        print(f"已加载 requester 预训练: {args.requester_pretrained}", flush=True)
+
     truth_tag = "with_truth" if args.include_truth_in_candidates else "no_truth"
-    logger = TrainingLogger(Path(args.log_dir), run_name=f"platform_dqn_{truth_tag}")
+    recall_tag = "mixed" if not args.no_mixed_recall else "legacy"
+    logger = TrainingLogger(
+        Path(args.log_dir),
+        run_name=f"platform_dqn_{args.reward_mode}_{truth_tag}_{recall_tag}",
+    )
     logger.save_config(
         {
             "dataset": ds.summary(),
@@ -137,15 +227,23 @@ def main() -> None:
         )
         log_metrics(logger, ep, "val", val_m, worker_agent, requester_agent)
 
-        if val_m["platform_reward"] > best_val:
-            best_val = val_m["platform_reward"]
+        val_score = validation_score(val_m)
+        if val_score > best_val:
+            best_val = val_score
             worker_agent.save_checkpoint(logger, "worker_best", extra={"episode": ep})
             requester_agent.save_checkpoint(
                 logger,
                 "requester_best",
                 extra={"episode": ep},
             )
-            print(f"  -> 新最佳 val platform_reward={best_val:.3f}", flush=True)
+            print(
+                f"  -> 新最佳 val_score={val_score:.4f} "
+                f"(worker_U={val_m.get('avg_worker_utility', 0):.4f}, "
+                f"requester_U={val_m.get('avg_requester_utility', 0):.4f}, "
+                f"worker_hit={val_m['worker_hit_rate']:.4f}, "
+                f"requester_hit={val_m['requester_hit_rate']:.4f})",
+                flush=True,
+            )
 
         if ep % args.save_every == 0:
             worker_agent.save_checkpoint(logger, f"worker_ep{ep:04d}")
@@ -155,6 +253,23 @@ def main() -> None:
     requester_agent.save_checkpoint(logger, "requester_final")
     logger.save_summary()
     print(f"训练完成。指标: {logger.metrics_csv}", flush=True)
+
+
+def validation_score(metrics: dict) -> float:
+    """utility 模式按平均效用 + 弱 hit/recall 选 checkpoint；legacy 仍参考 hit。"""
+    if "avg_worker_utility" in metrics:
+        return (
+            metrics.get("avg_worker_utility", 0.0)
+            + 5.0 * metrics.get("avg_requester_utility", 0.0)
+            + 0.05 * metrics.get("worker_hit_rate", 0.0)
+            + 0.10 * metrics.get("requester_hit_rate", 0.0)
+            + 0.02 * metrics.get("requester_recall_at_k", 0.0)
+        )
+    return (
+        metrics.get("worker_hit_rate", 0.0)
+        + 5.0 * metrics.get("requester_hit_rate", 0.0)
+        + 0.01 * metrics.get("worker_recall_at_k", 0.0)
+    )
 
 
 def build_with_limit(max_projects: int):

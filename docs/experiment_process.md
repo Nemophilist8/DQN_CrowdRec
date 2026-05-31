@@ -159,6 +159,86 @@
   - 单独提高 requester winner 识别能力，例如加入 winner 监督预训练、提高 winner bonus 或增加申请池质量分布特征。
   - 报告中应同时展示 hit rate、wait cost、unfilled project 和 rerouted workers，避免只按累计 platform reward 排序。
 
+### 2026-05-30 Platform 环境优化（混合召回 / reward 对齐 / 指标 / BC）
+
+- 目的：缓解 worker/requester hit 过低、platform_reward 累计口径误导、候选 recall 不足等问题。
+- 数据与设置：动态平台；`include_truth_in_candidates=False`；默认 Dueling + Double DQN。
+- 命令（smoke）：`python scripts/run_platform_baselines.py --split train --max-projects 50 --max-steps 200`；`python scripts/train_platform_dqn.py --max-projects 50 --episodes 1 --max-steps 50 --device cpu`
+- 模型相关困难/现象：
+  - worker hit 长期低于 industry_match 等启发式；requester hit 接近 0。
+  - 累计 `platform_reward` 被 worker 回流放大，`random+wait` 异常偏高。
+  - 候选 truth/winner 是否在 Top-K 内无法从 hit 单独判断。
+- 调整目的：扩大有效候选、强化 winner 信号、提供归一化指标与 Platform BC 预训练入口。
+- 具体调整：
+  - Worker 混合召回：匹配 / 热门 / 低等待 / 随机（`mixed_recall=True`，`--no-mixed-recall` 关闭）。
+  - Requester 候选池超 32 时优先保留历史 winner。
+  - 默认 reward 权重：`hit_reward=3.0`，`miss_penalty=-0.5`，`winner_bonus=2.0` 等。
+  - 新指标：`worker_recall_at_k`、`requester_recall_at_k`、`platform_reward_per_project`、`platform_reward_per_step`。
+  - 新增 `scripts/pretrained_platform_bc.py`；`train_platform_dqn.py` 支持 `--worker-pretrained` / `--requester-pretrained`，checkpoint 参考 hit 选 best。
+- 指标变化：50 项目 smoke 基线可正常输出；训练 1 episode 可跑通并写入 metrics。
+- 可能原因：即时 requester 决策导致申请池恒为 1，requester 学不到多人比较（见下条 batch 改造）。
+- 针对本次尝试的改进方向：Requester 批量/延迟决策；Platform 特征补全；utility 训练目标。
+
+### 2026-05-30 Platform 特征增强（industry_match + 申请池统计）
+
+- 目的：对齐 legacy 特征、为 requester「继续 WAIT 还是现在选」提供池内质量分布信号。
+- 具体调整：
+  - `PLATFORM_PROJECT_FEAT_DIM=14`：worker 候选 project 增加 `industry_match`。
+  - `REQUESTER_CONTEXT_FEAT_DIM=17`：project 上下文增加 `pool_mean_q`、`pool_max_q`、`pool_std_q`、`pool_top_gap`。
+  - Legacy `PROJECT_FEAT_DIM=13` 不变；旧 platform checkpoint 需重训。
+- 指标变化：特征 smoke 通过；BC/训练脚本已同步维度常量。
+
+### 2026-05-30 Requester 批量/延迟决策（方案 A）
+
+- 目的：解决「worker 每进池即触发 requester → 申请池几乎恒为 1 人」的结构性问题。
+- 具体调整（`env/platform_env.py`）：
+  - 默认 `requester_immediate_decision=False`，`requester_batch_size=8`，`requester_deadline_buffer_hours=24`。
+  - 触发 requester 决策：池 ≥ batch / 距 deadline ≤ buffer / 池满 32 / deadline 强制。
+  - 新指标 `avg_requester_pool_size`；CLI `--immediate-requester-decision` 恢复旧行为。
+- 指标变化（50 项目 / worker_quality 策略 smoke）：申请池均值由 **1.0 → 6.59**，中位数 **8**。
+- 可能原因：攒批后 requester 动作空间才接近「WAIT + 多 worker 比较」的设计初衷。
+
+### 2026-05-31 Utility reward 模式（默认训练目标）
+
+- 目的：训练目标对齐作业「最大化 worker/requester 利益」，hit 仅作离线一致性诊断。
+- 具体调整：
+  - `--reward-mode utility`（默认）| `legacy`（hit 为主对照）。
+  - Worker `U_worker`：奖金 log、类目/行业匹配、类目内历史能力、竞争惩罚 `-entry_count`；训练 reward=U，hit 仅 +`legacy_hit_weight=0.1`。
+  - Requester `U_requester`：quality、类目内预期分数、匹配、活跃度；不以 winner hit 为主 reward。
+  - BC 标签：utility 模式下为候选内 **argmax U**（非 history truth/winner）。
+  - Checkpoint：`utility` 按 `avg_worker_utility + 5×avg_requester_utility` 选 best；基线 CSV 增 utility 列。
+  - 公共 CLI：`add_platform_env_cli_args()` / `platform_env_config_from_args()`。
+- 命令：`python scripts/train_platform_dqn.py --reward-mode utility --max-projects 50 --episodes 1 --max-steps 50`
+- 指标变化（50 项目 utility smoke）：train `avg_requester_pool_size=7.8`；基线最佳效用 `industry_match+worker_industry_match`（worker_U≈0.242，requester_U≈0.678）。
+- 可能原因：离线数据无法评估未发生 (w,p) 的反事实效用；utility 为可观测 proxy。
+- 针对本次尝试的改进方向：**全量 utility 模式重训**；更新 `report_outline.md` 正式数字；Worker 侧 val/test active project 过少（可选扩大候选窗口）。
+
+### 2026-05-31 申请池/候选分布诊断脚本
+
+- 目的：量化 WAIT 策略与 batch 模式下的申请池规模、worker 有效候选数。
+- 具体调整：新增 `scripts/analyze_pool_candidates.py`；循环内须手动 `--max-steps`（环境未强制 `max_steps_per_episode`）。
+- 指标变化（50 项目 / 200 步 / WAIT + batch）：train 申请池 mean≈12.9，worker 候选中位数 2；val 申请池 mean≈7.1，worker 候选中位数 7。
+
+### 2026-05-31 Platform DQN 训练超参优化
+
+- 目的：修正默认参数偏调试口径、worker/requester 更新严重不对称、replay 过早覆盖、checkpoint 未参考 requester 等问题。
+- 数据与设置：utility + batch requester + mixed recall；Dueling + Double DQN。
+- 命令（smoke）：`python scripts/train_platform_dqn.py --max-projects 50 --episodes 2 --max-steps 100 --device cpu`
+- 模型相关困难/现象：
+  - 旧默认 `max_projects=100`、`max_steps=800` 仅覆盖全量 episode 约 7%；50 项目 smoke 下 requester 每 ep 梯度步≈0。
+  - worker/requester 共用 `batch=64`、`epsilon_decay=5000` 时，全量 1 ep 约 worker 1800 次更新 vs requester 433 次；worker 3 ep 内 ε 即接近 0.01，requester 仍长期随机。
+  - `buffer_size=50000` 下 worker 约 7 ep 后 replay 被覆盖。
+  - utility 模式 checkpoint 未含 `requester_hit` / `requester_recall_at_k`。
+- 调整目的：正式训练开箱即用全量完整 episode；两侧学习节奏更匹配；小规模也能更新 requester。
+- 具体调整（`scripts/train_platform_dqn.py`）：
+  - 默认改为 `max_projects=0`、`max_steps=0`、`episodes=20`、`device=cuda`。
+  - 分离超参：`worker_replay_batch=64` / `requester_replay_batch=32`；`worker_replay_buffer=100000` / `requester_replay_buffer=50000`；`worker_epsilon_decay=15000` / `requester=8000`；可选 `--requester-lr`。
+  - 保留 `--batch-size` / `--buffer-size` 同时覆盖两侧（兼容旧命令）。
+  - `validation_score` 增加 `0.10×requester_hit + 0.02×requester_recall_at_k`。
+- 指标变化（smoke 待用户全量跑）：50 项目 / 100 步 / 新默认下 requester 应出现 `global_step>0`（batch=32 更易达阈值）。
+- 可能原因：batch 模式下 requester 决策约为 worker 的 1/4，必须单独调小 batch 与 ε 衰减步数。
+- 针对本次尝试的改进方向：utility 全量重训 + test 基线；视曲线再调 `episodes` 或 requester BC 预训练。
+
 ### 2026-05-22 参与者侧全量 Vanilla DQN 初次训练
 
 - 目的：用全量项目训练参与者侧任务推荐模型，获得一版可用于后续 test 评估和 DQN 变体对比的 worker 侧基准模型。

@@ -4,6 +4,8 @@
 > 主实验：Worker-DQN 任务推荐 + Requester-DQN 动态选人/等待
 > 代码主线：`PlatformDataset` + `PlatformSimulationEnv`
 
+> **实现更新（2026-05-30/31，报告数字待重训后替换）**：默认 `--reward-mode utility`；Requester batch 决策（`batch_size=8`）；Worker 混合召回；Platform 特征 14/17 维；新指标含 `avg_worker/requester_utility`、`avg_requester_pool_size` 等。下文 §4 中 `report_full_20260529` 结果为**旧配置**，utility 全量重训后更新表格。
+
 ## 摘要
 
 - 研究问题：众包平台中 worker 到达、project 发布和 project 截止都随时间动态变化，平台需要同时为参与者推荐合适任务，并帮助请求者获得高质量投稿。
@@ -111,11 +113,12 @@ Project 特征 `x_p(t,w) in R^13`：
 | `log1p(hours_left)` | 距 deadline 剩余时间 |
 | `log1p(hours_open)` | 已开放时间 |
 | `category_match` | project 类目是否匹配 worker 历史主类目 |
+| `industry_match` | project 行业是否匹配 worker 历史主行业（Platform worker 候选 +1 维） |
 | `fill_ratio` | 当前申请池人数 / 目标投稿数 |
 | `remaining_ratio` | 剩余需求比例 |
 | `log1p(wait_days)` | project 已等待天数 |
 
-Requester 侧 project context 同样为 13 维，但最后一维使用 `log1p(applicants)` 表示当前申请池规模。
+Requester 侧 project context 为 **17 维**（`REQUESTER_CONTEXT_FEAT_DIM`）：13 维基础 + 4 维申请池 quality 统计（`pool_mean_q`、`pool_max_q`、`pool_std_q`、`pool_top_gap`）。
 
 ## 3 数学建模
 

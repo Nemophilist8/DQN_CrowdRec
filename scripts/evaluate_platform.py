@@ -11,12 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from env.platform_env import PlatformDecision, PlatformEnvConfig, PlatformSimulationEnv
+from env.platform_env import (
+    PlatformDecision,
+    PlatformSimulationEnv,
+    add_platform_env_cli_args,
+    platform_env_config_from_args,
+)
 from models.platform_baselines import make_platform_selectors
 from models.platform_training import run_platform_eval
 from src.config import Config, load_config
 from src.dataset import build_dataset
-from src.features import PROJECT_FEAT_DIM, WORKER_FEAT_DIM
+from src.features import (
+    PLATFORM_PROJECT_FEAT_DIM,
+    REQUESTER_CONTEXT_FEAT_DIM,
+    WORKER_FEAT_DIM,
+)
 from src.platform_dataset import PlatformDataset
 
 
@@ -34,15 +43,11 @@ def main() -> None:
     parser.add_argument("--project-wait-penalty", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--output", type=str, default=None)
+    add_platform_env_cli_args(parser)
     args = parser.parse_args()
 
     platform = PlatformDataset(build_with_limit(args.max_projects), args.split)
-    env_cfg = PlatformEnvConfig(
-        num_project_candidates=args.num_project_candidates,
-        num_worker_candidates=args.num_worker_candidates,
-        project_wait_penalty=args.project_wait_penalty,
-        include_truth_in_candidates=args.include_truth_in_candidates,
-    )
+    env_cfg = platform_env_config_from_args(args)
     env = PlatformSimulationEnv(platform, env_cfg, seed=42)
 
     worker_select, requester_select = build_selectors(args)
@@ -67,7 +72,9 @@ def main() -> None:
         f"requester={args.requester_policy} "
         f"platform_reward={metrics['platform_reward']:.2f} "
         f"worker_hit={metrics['worker_hit_rate']:.4f} "
-        f"requester_hit={metrics['requester_hit_rate']:.4f}",
+        f"requester_hit={metrics['requester_hit_rate']:.4f} "
+        f"worker_U={metrics.get('avg_worker_utility', 0):.4f} "
+        f"requester_U={metrics.get('avg_requester_utility', 0):.4f}",
         flush=True,
     )
 
@@ -134,9 +141,9 @@ def load_platform_agent(
     cfg = DQNConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
     if side == "worker":
         cfg.anchor_dim = WORKER_FEAT_DIM
-        cfg.candidate_dim = PROJECT_FEAT_DIM
+        cfg.candidate_dim = PLATFORM_PROJECT_FEAT_DIM
     else:
-        cfg.anchor_dim = PROJECT_FEAT_DIM
+        cfg.anchor_dim = REQUESTER_CONTEXT_FEAT_DIM
         cfg.candidate_dim = WORKER_FEAT_DIM
     agent = DQNAgent(num_actions=num_actions, config=cfg)
     agent.load(checkpoint, load_optimizer=False)

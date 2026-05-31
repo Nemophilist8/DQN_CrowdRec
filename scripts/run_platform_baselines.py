@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from env.platform_env import PlatformEnvConfig, PlatformSimulationEnv
+from env.platform_env import (
+    PlatformSimulationEnv,
+    add_platform_env_cli_args,
+    platform_env_config_from_args,
+)
 from models.platform_baselines import make_platform_selectors
 from models.platform_training import run_platform_eval
 from scripts.evaluate_platform import build_with_limit, load_platform_agent
@@ -42,6 +46,7 @@ def main() -> None:
     parser.add_argument("--worker-checkpoint", type=str, default=None)
     parser.add_argument("--requester-checkpoint", type=str, default=None)
     parser.add_argument("--output-dir", default="runs/platform_baselines")
+    add_platform_env_cli_args(parser)
     args = parser.parse_args()
 
     ds = build_with_limit(args.max_projects)
@@ -60,7 +65,9 @@ def main() -> None:
         print(
             f"  platform_reward={row['platform_reward']:.2f} "
             f"worker_hit={row['worker_hit_rate']:.4f} "
-            f"requester_hit={row['requester_hit_rate']:.4f}",
+            f"requester_hit={row['requester_hit_rate']:.4f} "
+            f"worker_U={row.get('avg_worker_utility', 0):.4f} "
+            f"requester_U={row.get('avg_requester_utility', 0):.4f}",
             flush=True,
         )
 
@@ -100,6 +107,9 @@ def main() -> None:
         "closed_projects",
         "unfilled_projects",
         "steps",
+        "avg_worker_utility",
+        "avg_requester_utility",
+        "avg_requester_pool_size",
         "include_truth_in_candidates",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -107,11 +117,19 @@ def main() -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-    best = max(rows, key=lambda row: row["platform_reward"])
+    best = max(
+        rows,
+        key=lambda row: (
+            row.get("avg_worker_utility", 0.0)
+            + row.get("avg_requester_utility", 0.0)
+        ),
+    )
     print(f"\n对比表: {csv_path}", flush=True)
     print(f"完整 JSON: {json_path}", flush=True)
     print(
-        f"最佳 Platform Reward: {best['policy']} -> {best['platform_reward']:.2f}",
+        f"最佳效用 (worker_U+requester_U): {best['policy']} -> "
+        f"{best.get('avg_worker_utility', 0):.4f} + "
+        f"{best.get('avg_requester_utility', 0):.4f}",
         flush=True,
     )
 
@@ -159,18 +177,13 @@ def evaluate_dqn(args, ds) -> dict:
 
 def build_env(args, ds) -> PlatformSimulationEnv:
     platform = PlatformDataset(ds, args.split)
-    cfg = PlatformEnvConfig(
-        num_project_candidates=args.num_project_candidates,
-        num_worker_candidates=args.num_worker_candidates,
-        include_truth_in_candidates=args.include_truth_in_candidates,
-        project_wait_penalty=args.project_wait_penalty,
-    )
+    cfg = platform_env_config_from_args(args)
     return PlatformSimulationEnv(platform, cfg, seed=42)
 
 
 def platform_dir_name(args) -> str:
     truth = "with_truth" if args.include_truth_in_candidates else "no_truth"
-    return f"platform_{args.split}_{truth}"
+    return f"platform_{args.split}_{args.reward_mode}_{truth}"
 
 
 if __name__ == "__main__":
